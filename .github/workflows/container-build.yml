@@ -1,0 +1,83 @@
+name: Build & Push Keycloak Custom Image
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  get_tag:
+    runs-on: ubuntu-latest
+    env:
+      LAST_DIGEST: ${{ vars.LAST_KNOWN_DIGEST }}
+    steps:
+      - name: Checkout code (optional, but good practice)
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Get Keycloak tags
+        id: meta
+        run: python3 get_keycloak_tags.py
+
+      - name: Fetch Old Digest
+        id: check_state
+        run: |
+          git fetch origin version-state:version-state || echo "Branch not found"
+          
+          if git show version-state:digest.txt > /dev/null 2>&1; then
+            OLD_DIGEST=$(git show version-state:digest.txt | tr -d '\n')
+          else
+            OLD_DIGEST="none"
+          fi
+          
+          echo "Old Digest: $OLD_DIGEST"
+          echo "New Digest: ${{ steps.meta.outputs.current_digest }}"
+          
+          if [ "$OLD_DIGEST" != "${{ steps.meta.outputs.current_digest }}" ]; then
+            echo "update_needed=true" >> $GITHUB_OUTPUT
+            echo "::notice::New version detected!"
+          else
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+            echo "::notice::No changes detected."
+          fi
+
+      - name: Login to Docker Hub
+        if: steps.check_state.outputs.update_needed == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: sum1re
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Set up Docker Buildx
+        if: steps.check_state.outputs.update_needed == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Docker Hub
+        if: steps.check_state.outputs.update_needed == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          build-args: |
+            VERSION=${{ steps.meta.outputs.main_version }}
+          file: Containerfile
+          tags: ${{ steps.meta.outputs.formatted_tags }}
+
+      - name: Update State File
+        if: steps.check_state.outputs.update_needed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout version-state
+          echo "${{ steps.meta.outputs.current_digest }}" > digest.txt
+          git add digest.txt
+          git commit -m "Update digest to ${{ steps.meta.outputs.current_digest }} (Version: ${{ steps.meta.outputs.main_version }})"
+          git push origin version-state
